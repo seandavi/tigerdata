@@ -1,0 +1,274 @@
+drop all
+
+CREATE VERTEX taxonomy (
+    PRIMARY_ID taxon_id INT,
+    name STRING
+)
+
+
+CREATE VERTEX ontology_term (
+    PRIMARY_ID class_id STRING,
+    name STRING,
+    synonyms STRING,
+    definitions STRING,
+    semantic_types STRING,
+    ontology STRING
+)
+
+CREATE DIRECTED EDGE Has_Parent (
+    FROM ontology_term, TO ontology_term |
+    FROM taxonomy, TO taxonomy
+) WITH REVERSE_EDGE="Has_Child"
+
+CREATE VERTEX study (
+    PRIMARY_ID study_id STRING,
+    study_design SET<STRING>,
+    pubmed_id INT,
+    doi STRING,
+    authors SET<STRING>,
+    title STRING,
+    journal STRING,
+    year INT,
+    abstract STRING
+)
+
+CREATE VERTEX experiment (
+    PRIMARY_ID experiment_id STRING,
+    experiment_id STRING,
+    location SET<STRING>,
+    statistical_test STRING,
+    significance FLOAT
+)
+
+CREATE VERTEX condition (
+    PRIMARY_ID name STRING,
+    name STRING
+)
+
+CREATE DIRECTED EDGE Experiment_Condition (
+    FROM experiment,
+    TO condition
+) WITH REVERSE_EDGE="Condition_Experiment"
+
+CREATE DIRECTED EDGE Experiment_Ontology (
+    FROM experiment,
+    TO ontology_term
+) WITH REVERSE_EDGE="Ontology_Experiment"
+
+CREATE DIRECTED EDGE Experiment_Study (
+    FROM experiment,
+    TO study
+) WITH REVERSE_EDGE="Study_Experiment"
+
+CREATE DIRECTED EDGE Experiment_HostTaxonomy (
+    FROM experiment,
+    TO taxonomy
+) WITH REVERSE_EDGE="HostTaxonomy_Experiment"
+
+CREATE VERTEX body_site (
+    PRIMARY_ID site STRING,
+    site STRING
+)
+
+CREATE DIRECTED EDGE Experiment_BodySite (
+    FROM experiment,
+    TO body_site
+) WITH REVERSE_EDGE="BodySite_Experiment"
+
+CREATE VERTEX signature (
+    PRIMARY_ID signature_id STRING,
+    source STRING,
+    description STRING
+)
+
+CREATE DIRECTED EDGE Signature_Taxonomy (
+    FROM signature,
+    TO taxonomy,
+    effect STRING
+) WITH REVERSE_EDGE="Taxonomy_Signature"
+
+CREATE DIRECTED EDGE Signature_Experiment (
+    FROM signature,
+    TO experiment
+) WITH REVERSE_EDGE="Experiment_Signature"
+
+CREATE GRAPH bugsigdb (*)
+
+USE GRAPH bugsigdb
+
+
+BEGIN
+
+CREATE LOADING JOB load_ontology FOR GRAPH bugsigdb {
+    DEFINE FILENAME ontology_csv="/home/tigergraph/mydata/EFO.csv";
+
+    LOAD ontology_csv to TEMP_TABLE t1(term,parent) VALUES($0, flatten($7,"|",1)) USING header="true", separator=",", quote="double";
+
+    LOAD ontology_csv to VERTEX ontology_term VALUES($0, $1, $2, $3, $6, _) USING header="true", separator=",", quote="double";
+    LOAD TEMP_TABLE t1
+        TO EDGE Has_Parent VALUES($"term" ontology_term, $"parent" ontology_term);
+}
+RUN LOADING JOB load_ontology USING ontology_csv="/home/tigergraph/mydata/EFO.csv"
+RUN LOADING JOB load_ontology USING ontology_csv="/home/tigergraph/mydata/uberon.csv"
+
+
+CREATE LOADING JOB load_ncbi_taxon FOR GRAPH bugsigdb {
+    DEFINE FILENAME names_dmp="/home/tigergraph/mydata/names.tsv";
+    DEFINE FILENAME nodes_dmp="/home/tigergraph/mydata/nodes.tsv";
+
+    LOAD names_dmp to VERTEX taxonomy VALUES ($0,$1) USING header="false", separator="\t";
+    LOAD nodes_dmp to EDGE Has_Parent VALUES ($0 taxonomy,$1 taxonomy) USING header="false", separator="\t";
+}
+RUN LOADING JOB load_ncbi_taxon
+
+CREATE LOADING JOB load_bugsigdb_dump FOR GRAPH bugsigdb {
+    DEFINE FILENAME studies_csv="/home/tigergraph/mydata/studies.csv";
+    DEFINE FILENAME experiments_csv="/home/tigergraph/mydata/experiments.csv";
+    DEFINE FILENAME signatures_fixed_csv="/home/tigergraph/mydata/signatures_fixed.csv";
+
+
+    LOAD studies_csv to VERTEX study VALUES ($0, SPLIT($1,","), $2, $3, SPLIT($5,","),$6,$7,$8, $9)
+        USING header="true", separator=",", quote="double";
+    LOAD experiments_csv
+        TO VERTEX experiment VALUES ($0, $0, split($2,","), $15, $16),
+        TO VERTEX body_site VALUES ($4, $4),
+        TO VERTEX condition VALUES ($5, $5)
+            where $5!="",
+        TO EDGE Experiment_BodySite VALUES($0, $4),
+        TO EDGE Experiment_Study VALUES($0, $1),
+        TO EDGE Experiment_Condition VALUES ($0, $5),
+        TO EDGE Experiment_HostTaxonomy VALUES($0, 9606)
+            WHERE $3=="human",
+        TO EDGE Experiment_HostTaxonomy VALUES($0, 10116)
+            WHERE $3=="rat"
+            USING header="true", separator=",", quote="double";
+    LOAD signatures_fixed_csv
+        TO VERTEX signature values ($0, $2, $3),
+        TO EDGE Signature_Taxonomy values ($0, $5, $4),
+        TO EDGE Signature_Experiment values ($0, $1)
+            USING header="true", separator=",", quote="double";
+
+
+}
+RUN LOADING JOB load_bugsigdb_dump
+
+
+END
+
+CREATE QUERY experimentDetailsToOntology() FOR GRAPH bugsigdb syntax v2 {
+
+  TYPEDEF tuple<STRING site_name, VERTEX<ontology_term> term> siteOntology;
+
+  # This map will contain mapping from ontology preferred term to ontology node
+  MapAccum<STRING, VERTEX<ontology_term>> @@SO;
+  # This map contains mapping from body_site to experiment it applies to
+  MapAccum<STRING, VERTEX<experiment>> @@sites;
+
+  # all ontology terms
+  start = {ontology_term.*};
+  # all body sites
+  start2 = {body_site.*};
+  start3 = {condition.*};
+
+  # for all ontology terms, create map from term name to node
+  # ("feces" -> associated ontology term)
+  # TODO: limit to correct ontology
+  A = SELECT i FROM start:i
+      ACCUM
+          @@SO += (i.name -> i);
+
+  # For all body sites, map from body site name to experiment
+  # ("mouth" -> associated experiment node)
+  B = SELECT j from start2:j -(<Experiment_BodySite)- experiment:e
+      ACCUM
+          @@sites += (j.site -> e);
+
+  # For all body sites, map from condition name to experiment
+  # ("mouth" -> associated experiment node)
+  C = SELECT j from start3:j -(<Experiment_Condition)- experiment:e
+      ACCUM
+          @@sites += (j.name -> e);
+
+  foreach (k, v) in @@sites DO
+      if @@SO.containsKey(k) THEN
+        print k;
+        print @@SO.get(k), v;
+        INSERT INTO Experiment_Ontology (FROM, TO) VALUES (v, @@SO.get(k));
+      END;
+  END;
+}
+
+CREATE QUERY ontologyTermToExperiment(STRING onto_name)
+FOR GRAPH bugsigdb syntax v2 {
+/*
+
+For a given ontology name, eg. "neoplasm", return the experiment, study, intervening ontology
+terms
+*/
+
+  start = {ontology_term.*};
+
+  A = SELECT s from start:t -(Has_Child>*1..3)- ontology_term:b -(Ontology_Experiment>)- experiment:e -(Experiment_Study>)- study:s
+      WHERE t.name==onto_name;
+  B = SELECT e from start:t -(Has_Child>*1..3)- ontology_term:b -(Ontology_Experiment>)- experiment:e -(Experiment_Study>)- study:s
+      WHERE t.name==onto_name;
+
+  C = SELECT b from start:t -(Has_Child>*1..3)- ontology_term:b -(Ontology_Experiment>)- experiment:e -(Experiment_Study>)- study:s
+      WHERE t.name==onto_name;
+
+  print A;
+  PRINT B;
+  PRINT C;
+}
+
+CREATE QUERY jaccard_nbor_ss (VERTEX source, STRING e_type, STRING rev_e_type,
+ INT top_k = 100, BOOL print_accum = TRUE, STRING similarity_edge_type = "", STRING file_path = "") for graph bugsigdb {
+/*
+Calculates the Jaccard Similarity between a given vertex and every other vertex.
+  Jaccard similarity = intersection_size / (size_A + size_B - intersection_size)
+Parameters:
+ source: start vertex                           top_k: #top scores to report
+ e_type: directed edge types to traverse        print_accum: print JSON output
+ rev_e_type: reverse edge types to traverse     file_path: file to write CSV output to
+ similarity_edge_type: edge type for storing vertex-vertex similarity scores
+
+  This query current supports only a single edge type (not a set of types) - 8/13/20
+*/
+	SumAccum<INT> @intersection_size, @@set_size_A, @set_size_B;
+	SumAccum<FLOAT> @similarity;
+	FILE f (file_path);
+
+	Start (ANY) = {source};
+	Start = SELECT s
+	    FROM Start:s
+			ACCUM @@set_size_A += s.outdegree(e_type);
+
+	Subjects = SELECT t
+			   FROM Start:s-(e_type:e)-:t;
+
+	Others = SELECT t
+			 FROM Subjects:s -(rev_e_type:e)- :t
+			 WHERE t != source
+			 ACCUM t.@intersection_size += 1,
+				   t.@set_size_B = t.outdegree(e_type)
+			 POST-ACCUM t.@similarity = t.@intersection_size*1.0/(@@set_size_A + t.@set_size_B - t.@intersection_size)
+			 ORDER BY t.@similarity DESC
+			 LIMIT top_k;
+
+	IF file_path != "" THEN
+		f.println("Vertex1", "Vertex2", "Similarity");
+	END;
+
+
+	Others = SELECT s
+			 FROM Others:s
+			 POST-ACCUM
+				IF similarity_edge_type != "" THEN
+					INSERT INTO EDGE similarity_edge_type VALUES (source, s, s.@similarity)
+				END,
+				IF file_path != "" THEN f.println(source, s, s.@similarity) END;
+
+	IF print_accum THEN
+		PRINT Others[Others.@similarity];
+	END;
+}

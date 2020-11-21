@@ -1,0 +1,25 @@
+---
+title: tigergraph
+---
+
+# REST api
+
+- Vertex numbers
+```{bash}
+http POST localhost:9000/builtins/bugsigdb function="stat_vertex_number" type="*" | jq .
+```
+
+- Edge numbers
+
+
+```{bash}
+http POST localhost:9000/builtins/bugsigdb function="stat_edge_number" type="*" | jq .
+```
+
+
+
+## GSQL
+
+``` sh
+select count(*) from taxonomy
+```
